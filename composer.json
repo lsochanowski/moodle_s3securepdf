@@ -1,9 +1,14 @@
 {
-  "name": "yourorg/moodle-mod_s3securepdf",
+  "name": "moodle/mod_s3securepdf",
   "type": "moodle-mod",
   "require": {
-    "setasign/fpdi": "^2.6",
-    "setasign/fpdf": "^1.8"
+    "aws/aws-sdk-php": "^3.300",
+    "setasign/fpdf": "^1.8",
+    "setasign/fpdi": "^2.5"
   },
-  "config": { "optimize-autoloader": true }
+  "autoload": {
+    "psr-4": {
+      "mod_s3securepdf\\": "classes/"
+    }
+  }
 }

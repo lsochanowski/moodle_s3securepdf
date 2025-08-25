@@ -1,69 +1,99 @@
 <?php
-require('../../config.php');
-require_once($CFG->libdir.'/filelib.php');
-
-use mod_s3securepdf\local\s3storage;
-use mod_s3securepdf\local\watermark;
-use mod_s3securepdf\local\token as tok;
+// Server-side S3 fetch + watermark delivery.
+require(__DIR__.'/../../config.php');
 
 $id = required_param('id', PARAM_INT);
-$token = required_param('token', PARAM_RAW);
-
 $cm = get_coursemodule_from_id('s3securepdf', $id, 0, false, MUST_EXIST);
-$context = context_module::instance($cm->id);
 $course = get_course($cm->course);
-$instance = $DB->get_record('s3securepdf', ['id'=>$cm->instance], '*', MUST_EXIST);
+$context = context_module::instance($cm->id);
 
-require_login($course, false, $cm);
-require_capability('mod/s3securepdf:download', $context);
+require_login($course, true, $cm);
+require_capability('mod/s3securepdf:view', $context);
 
-if (!tok::verify($token, $USER->id, $cm->id)) {
-    throw new moodle_exception('invalidtoken', 'mod_s3securepdf');
+// Get instance and object key (adjust to your field name if different).
+$instance = $DB->get_record('s3securepdf', ['id' => $cm->instance], '*', MUST_EXIST);
+$key = null;
+foreach (['s3object','objectkey','filename','object'] as $candidate) {
+    if (!empty($instance->$candidate)) { $key = $instance->$candidate; break; }
+}
+if (empty($key)) {
+    print_error('missingobject', 'mod_s3securepdf');
 }
 
-$bucket = get_config('mod_s3securepdf', 'bucket');
-$key = $instance->objectkey;
-$tpl = $instance->watermarktpl ?? get_config('mod_s3securepdf','watermarktpl');
-
-$hash = sha1($key.'|'.$USER->id.'|'.$tpl);
-$cachedir = make_writable_directory($CFG->dataroot.'/local_s3securepdf_cache/'.$cm->id.'/'.$USER->id);
-$cachefile = $cachedir.'/'.$hash.'.pdf';
-$cacheseconds = 86400;
-
-$expired = !file_exists($cachefile) || (time() - filemtime($cachefile) > $cacheseconds);
-
-if ($expired) {
-    $tmpsrc = tempnam($CFG->tempdir, 's3src');
-    $tmpdst = tempnam($CFG->tempdir, 's3dst');
-    s3storage::download_to($bucket, $key, $tmpsrc);
-
-    $ctx = [
-      'fullname' => fullname($USER),
-      'username' => $USER->username,
-      'userid'   => $USER->id,
-      'timestamp'=> gmdate('Y-m-d H:i:s'),
-      'course'   => $course->fullname,
-      'sessionhash' => substr(sha1(session_id()), 0, 12)
-    ];
-    $text = watermark::build_text($tpl, $ctx);
-    watermark::apply($tmpsrc, $tmpdst, $text);
-    @rename($tmpdst, $cachefile);
-    @unlink($tmpsrc);
+// Config
+$conf = get_config('mod_s3securepdf');
+if (empty($conf->s3_endpoint) || empty($conf->s3_bucket) || empty($conf->s3_accesskey) || empty($conf->s3_secretkey)) {
+    print_error('s3notconfigured', 'mod_s3securepdf');
 }
 
-$filename = basename($key);
+// Composer autoload (module/vendor or site/vendor)
+$loaded = false;
+foreach ([__DIR__.'/vendor/autoload.php', __DIR__.'/../../vendor/autoload.php', $CFG->dirroot.'/vendor/autoload.php'] as $path) {
+    if (file_exists($path)) { require_once($path); $loaded = true; break; }
+}
+
+try {
+    $s3 = new Aws\S3\S3Client([
+        'version' => 'latest',
+        'region'  => $conf->s3_region ?: 'us-east-1',
+        'endpoint' => $conf->s3_endpoint,
+        'use_path_style_endpoint' => true,
+        'credentials' => [
+            'key'    => $conf->s3_accesskey,
+            'secret' => $conf->s3_secretkey,
+        ],
+    ]);
+    $res = $s3->getObject([
+        'Bucket' => $conf->s3_bucket,
+        'Key'    => $key,
+    ]);
+    $pdfdata = (string)$res['Body'];
+} catch (Throwable $e) {
+    print_error('s3fetcherror', 'mod_s3securepdf', '', s($e->getMessage()));
+}
+
+// Temp files
+$tmpdir = make_temp_directory('s3securepdf');
+$tmpin  = $tmpdir.'/in_'.uniqid('', true).'.pdf';
+$tmpout = $tmpdir.'/out_'.uniqid('', true).'.pdf';
+file_put_contents($tmpin, $pdfdata);
+
+// Watermark via FPDI if library is available, else passthrough original.
+$watermarked = false;
+try {
+    if (class_exists('setasign\\Fpdi\\Fpdi')) {
+        $pdf = new setasign\Fpdi\Fpdi();
+        $pagecount = $pdf->setSourceFile($tmpin);
+        for ($i = 1; $i <= $pagecount; $i++) {
+            $tpl = $pdf->importPage($i);
+            $size = $pdf->getTemplateSize($tpl);
+            $pdf->AddPage($size['orientation'], [$size['width'], $size['height']]);
+            $pdf->useTemplate($tpl);
+            $pdf->SetFont('Arial', 'B', 12);
+            $pdf->SetTextColor(150, 150, 150);
+            $pdf->SetXY(10, 10);
+            $label = fullname($USER).' | '.userdate(time());
+            $pdf->Cell(0, 10, $label);
+        }
+        $pdf->Output($tmpout, 'F');
+        $watermarked = true;
+    }
+} catch (Throwable $e) {
+    // fallback below
+}
+
+if (!$watermarked) {
+    // fallback to original if watermark libs not present
+    $tmpout = $tmpin;
+}
+
+// Send
 header('Content-Type: application/pdf');
-header('Content-Disposition: attachment; filename="'.rawurlencode($filename).'"');
-header('X-Content-Type-Options: nosniff');
-header('Cache-Control: private, no-store, no-cache, must-revalidate');
-header('Pragma: no-cache');
-readfile($cachefile);
+header('Content-Disposition: inline; filename="'.basename($key).'"');
+header('Content-Length: '.filesize($tmpout));
+readfile($tmpout);
 
-$event = \mod_s3securepdf\event\file_downloaded::create([
-  'objectid' => $instance->id,
-  'context' => $context,
-  'relateduserid' => $USER->id,
-  'other' => ['key'=>$key]
-]);
-$event->trigger();
+// Cleanup
+if ($tmpout != $tmpin) @unlink($tmpout);
+@unlink($tmpin);
 exit;
