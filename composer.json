@@ -1,0 +1,9 @@
+{
+  "name": "yourorg/moodle-mod_s3securepdf",
+  "type": "moodle-mod",
+  "require": {
+    "setasign/fpdi": "^2.6",
+    "setasign/fpdf": "^1.8"
+  },
+  "config": { "optimize-autoloader": true }
+}
